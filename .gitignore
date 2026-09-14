@@ -1,0 +1,5 @@
+.build/
+.cache/
+*.app
+.DS_Store
+/main
