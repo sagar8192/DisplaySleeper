@@ -49,8 +49,8 @@ public class LidLatchManager {
     public func startMonitoring() {
         guard pollTimer == nil else { return }
         
-        // 1. Poll the hardware registry flag every 0.5 seconds
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        // 1. Poll the hardware registry flag every 10ms (0.01s)
+        let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in
             self?.checkLidState()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -127,8 +127,15 @@ public class LidLatchManager {
             let now = Date()
             if lastSleepCallTime == nil || now.timeIntervalSince(lastSleepCallTime!) >= 1.0 {
                 lastSleepCallTime = now
-                NSLog("[DisplaySleeper] Hardware overshoot detected. Enforcing system sleep.")
-                print("[DisplaySleeper] Hardware overshoot detected. Enforcing system sleep.")
+                let durationStr: String
+                if let latchTime = latchTrippedTime {
+                    let ms = now.timeIntervalSince(latchTime) * 1000
+                    durationStr = String(format: " (%.0fms in sensor zone)", ms)
+                } else {
+                    durationStr = ""
+                }
+                NSLog("[DisplaySleeper] Hardware overshoot detected%@. Enforcing system sleep.", durationStr)
+                print("[DisplaySleeper] Hardware overshoot detected\(durationStr). Enforcing system sleep.")
                 fflush(stdout)
                 displaySleeper()
             }
