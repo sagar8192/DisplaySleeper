@@ -76,7 +76,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         let isTrusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
         if !isTrusted {
-            let msg = "[DisplaySleeper] Note: Accessibility permissions not yet granted. System prompt requested. Note: CGEventSource zero-permission fallback is active for keyboard/click wake detection."
+            let msg = "[DisplaySleeper] Note: Accessibility permissions optional. Hardware sensor sweep & SMC wake detection operate with zero permissions required."
             NSLog(msg)
             print(msg)
             fflush(stdout)
