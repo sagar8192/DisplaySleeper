@@ -15,21 +15,17 @@ public class LidLatchManager {
     
     // Configurable hooks for testing / dependency injection
     var clamshellReader: () -> Bool
-    var wakeReasonReader: () -> String
     var displaySleeper: () -> Void
     var wakeTrigger: () -> Void
-    private var keyPressTimestamps: [Date] = []
     
     public init(
         autoStart: Bool = true,
         dryRun: Bool = false,
         clamshellReader: (() -> Bool)? = nil,
-        wakeReasonReader: (() -> String)? = nil,
         displaySleeper: (() -> Void)? = nil,
         wakeTrigger: (() -> Void)? = nil
     ) {
         self.clamshellReader = clamshellReader ?? LidLatchManager.defaultReadHardwareLidFlag
-        self.wakeReasonReader = wakeReasonReader ?? LidLatchManager.defaultReadWakeReason
 
         if dryRun {
             self.displaySleeper = {
@@ -87,12 +83,24 @@ public class LidLatchManager {
     public func checkLidState() {
         let lidIsCurrentlyClosed = clamshellReader()
         
-        // 1. Check if hardware SMC reports a lid-open wake from sleep
-        if userIntendsToClose && wasInOvershoot {
-            let reason = wakeReasonReader()
-            if reason.localizedCaseInsensitiveContains("lid") {
-                disarmLatch(reason: "Lid open wake detected via SMC Wake Reason (\(reason)).")
-                return
+        // 1. User Input Wake Check:
+        // Check if user pressed a key or clicked without needing Accessibility permissions.
+        if userIntendsToClose {
+            if let latchTime = latchTrippedTime, Date().timeIntervalSince(latchTime) > 1.0 {
+                let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+                let flagsIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .flagsChanged)
+                let clickIdle = min(
+                    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .leftMouseDown),
+                    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .rightMouseDown)
+                )
+                
+                if keyIdle < 0.8 || flagsIdle < 0.8 || clickIdle < 0.8 {
+                    NSLog("[DisplaySleeper] User input detected via CGEventSource (keyIdle: %.2fs, clickIdle: %.2fs). Releasing latch.", keyIdle, clickIdle)
+                    print("[DisplaySleeper] User input detected. Releasing display lock.")
+                    fflush(stdout)
+                    handleKeyPress()
+                    return
+                }
             }
         }
         
@@ -134,40 +142,30 @@ public class LidLatchManager {
         } else if lidIsCurrentlyClosed && userIntendsToClose && wasInOvershoot {
             // SENSOR HIT TRUE AFTER OVERSHOOT: The lid was flush closed (overshoot) and is now
             // passing back through the 1-2 inch sensor zone as the user lifts it open!
-            disarmLatch(reason: "Lid opening detected (sensor transitioned to True from overshoot).")
+            userIntendsToClose = false
+            wasInOvershoot = false
+            latchTrippedTime = nil
+            lastSleepCallTime = nil
+            latchReleasedTime = Date()
+            NSLog("[DisplaySleeper] Lid opening detected (sensor transitioned to True from overshoot). Releasing display lock.")
+            print("[DisplaySleeper] Lid opening detected. Releasing display lock.")
+            fflush(stdout)
+            wakeTrigger()
         }
-    }
-    
-    private func disarmLatch(reason: String) {
-        userIntendsToClose = false
-        wasInOvershoot = false
-        latchTrippedTime = nil
-        lastSleepCallTime = nil
-        latchReleasedTime = Date()
-        NSLog("[DisplaySleeper] %@ Releasing display lock.", reason)
-        print("[DisplaySleeper] \(reason) Releasing display lock.")
-        fflush(stdout)
-        wakeTrigger()
     }
     
     public func handleKeyPress() {
-        guard userIntendsToClose else { return }
-        
-        if !wasInOvershoot {
-            // Latch was tripped at 1-2" but lid was not closed flush. Single press wakes.
-            disarmLatch(reason: "Keypress detected before flush closure.")
-            return
-        }
-        
-        // In overshoot (flush closed in bag or resting). Require 3 rapid keypresses within 1.5s
-        // as an intentional emergency override. Accidental bag bumps will NEVER disarm the latch!
-        let now = Date()
-        keyPressTimestamps.append(now)
-        keyPressTimestamps = keyPressTimestamps.filter { now.timeIntervalSince($0) <= 1.5 }
-        
-        if keyPressTimestamps.count >= 3 {
-            keyPressTimestamps.removeAll()
-            disarmLatch(reason: "Emergency triple-keypress override detected.")
+        if userIntendsToClose {
+            // RESET LATCH: User pressed a key, meaning they want the Mac awake
+            userIntendsToClose = false
+            wasInOvershoot = false
+            latchTrippedTime = nil
+            lastSleepCallTime = nil
+            latchReleasedTime = Date()
+            NSLog("[DisplaySleeper] Keypress detected. Releasing display lock.")
+            print("[DisplaySleeper] Keypress detected. Releasing display lock.")
+            fflush(stdout)
+            wakeTrigger()
         }
     }
     
@@ -191,23 +189,6 @@ public class LidLatchManager {
             return state
         }
         return false
-    }
-    
-    public static func defaultReadWakeReason() -> String {
-        let entry = IORegistryEntryFromPath(kIOMainPortDefault, "IOService:/")
-        guard entry != MACH_PORT_NULL else { return "" }
-        defer { IOObjectRelease(entry) }
-        
-        if let reason = IORegistryEntrySearchCFProperty(
-            entry,
-            kIOServicePlane,
-            "Wake Reason" as CFString,
-            kCFAllocatorDefault,
-            IOOptionBits(kIORegistryIterateRecursively)
-        ) as? String {
-            return reason
-        }
-        return ""
     }
     
     public static func defaultForceDisplaySleep() {

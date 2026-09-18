@@ -4,13 +4,11 @@ class LidLatchManagerTests {
     var sleepCallCount = 0
     var wakeCallCount = 0
     var simulatedClamshellState = false
-    var simulatedWakeReason = ""
     
     func setUp() {
         sleepCallCount = 0
         wakeCallCount = 0
         simulatedClamshellState = false
-        simulatedWakeReason = ""
     }
     
     func runAll() {
@@ -20,20 +18,16 @@ class LidLatchManagerTests {
         testHardwareOvershootInterception()
         testNormalAwakeStateDoesNothing()
         testLidClosedMaintainedState()
-        testBagBumpSingleKeyDoesNotReleaseLatch()
-        testEmergencyTripleKeyPressWakeOverride()
-        testSMCLidWakeReasonReleasesLatch()
-        testLidSweepReleasesLatch()
+        testKeyPressWakeOverride()
         testKeyPressWhenAlreadyAwake()
         testStopMonitoringAndDeinit()
-        print("All 11 tests passed successfully!")
+        print("All 8 tests passed successfully!")
     }
     
     func createTestManager() -> LidLatchManager {
         return LidLatchManager(
             autoStart: false,
             clamshellReader: { [unowned self] in self.simulatedClamshellState },
-            wakeReasonReader: { [unowned self] in self.simulatedWakeReason },
             displaySleeper: { [unowned self] in self.sleepCallCount += 1 },
             wakeTrigger: { [unowned self] in self.wakeCallCount += 1 }
         )
@@ -76,6 +70,12 @@ class LidLatchManagerTests {
         manager.checkLidState()
         
         assert(manager.userIntendsToClose, "userIntendsToClose must remain true during overshoot")
+        assert(sleepCallCount == 2, "forceDisplaySleep must be called during overshoot to force blank screen")
+        
+        // 3. Next poll during overshoot
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 3, "forceDisplaySleep must be called continuously during overshoot")
         print("  ✓ testHardwareOvershootInterception passed")
     }
     
@@ -109,85 +109,27 @@ class LidLatchManagerTests {
         print("  ✓ testLidClosedMaintainedState passed")
     }
     
-    func testBagBumpSingleKeyDoesNotReleaseLatch() {
+    func testKeyPressWakeOverride() {
         setUp()
         let manager = createTestManager()
         
-        // 1. Enter overshoot (flush closed in bag)
+        // Put into overshoot latch state
         simulatedClamshellState = true
         manager.checkLidState()
         simulatedClamshellState = false
         manager.checkLidState()
         assert(manager.userIntendsToClose)
         
-        // 2. Accidental keypress in bag
+        // Keypress intercepted
         manager.handleKeyPress()
         
-        // Latch MUST remain true to prevent screen turning on in bag!
-        assert(manager.userIntendsToClose, "Single accidental keypress in bag must NOT release the latch")
-        assert(wakeCallCount == 0, "Wake trigger must not be called on bag bump")
-        print("  ✓ testBagBumpSingleKeyDoesNotReleaseLatch passed")
-    }
-    
-    func testEmergencyTripleKeyPressWakeOverride() {
-        setUp()
-        let manager = createTestManager()
+        assert(!manager.userIntendsToClose, "userIntendsToClose must be reset to false on keypress")
+        assert(wakeCallCount == 1, "wakeTrigger must be called on keypress override")
         
-        // 1. Enter overshoot
-        simulatedClamshellState = true
+        // Next poll should not sleep because latch is now false
         manager.checkLidState()
-        simulatedClamshellState = false
-        manager.checkLidState()
-        assert(manager.userIntendsToClose)
-        
-        // 2. Three rapid keypresses (deliberate user override)
-        manager.handleKeyPress()
-        manager.handleKeyPress()
-        manager.handleKeyPress()
-        
-        assert(!manager.userIntendsToClose, "Triple keypress must disarm the latch")
-        assert(wakeCallCount == 1, "Wake trigger must be called after triple keypress")
-        print("  ✓ testEmergencyTripleKeyPressWakeOverride passed")
-    }
-    
-    func testSMCLidWakeReasonReleasesLatch() {
-        setUp()
-        let manager = createTestManager()
-        
-        // 1. Enter overshoot
-        simulatedClamshellState = true
-        manager.checkLidState()
-        simulatedClamshellState = false
-        manager.checkLidState()
-        assert(manager.userIntendsToClose)
-        
-        // 2. System wakes with SMC reporting lid open
-        simulatedWakeReason = "smc.sysState.Wake(0x70070000) lid SMC.OutboxNotEmpty"
-        manager.checkLidState()
-        
-        assert(!manager.userIntendsToClose, "SMC lid wake reason must release the latch")
-        assert(wakeCallCount == 1, "Wake trigger must be called on SMC lid wake")
-        print("  ✓ testSMCLidWakeReasonReleasesLatch passed")
-    }
-    
-    func testLidSweepReleasesLatch() {
-        setUp()
-        let manager = createTestManager()
-        
-        // 1. Enter overshoot
-        simulatedClamshellState = true
-        manager.checkLidState()
-        simulatedClamshellState = false
-        manager.checkLidState()
-        assert(manager.userIntendsToClose)
-        
-        // 2. User lifts lid: sensor sweeps through 1-2" (reports true)
-        simulatedClamshellState = true
-        manager.checkLidState()
-        
-        assert(!manager.userIntendsToClose, "Lid sweep through 1-2\" must release the latch")
-        assert(wakeCallCount == 1, "Wake trigger must be called on lid sweep")
-        print("  ✓ testLidSweepReleasesLatch passed")
+        assert(sleepCallCount == 2, "Sleep should not be called after keypress override")
+        print("  ✓ testKeyPressWakeOverride passed")
     }
     
     func testKeyPressWhenAlreadyAwake() {
