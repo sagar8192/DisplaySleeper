@@ -13,6 +13,20 @@ public class LidLatchManager {
     private var lastSleepCallTime: Date?
     private var wasInOvershoot = false
     
+    // Clamshell change notifications (catch transitions shorter than the poll interval)
+    private var rootDomainService: io_service_t = 0
+    private var clamshellNotifyPort: IONotificationPortRef?
+    private var clamshellNotifier: io_object_t = 0
+    private var pollActivity: NSObjectProtocol?
+    
+    // Diagnostics
+    private var lastPolledState: Bool?
+    private var lastPollTime: Date?
+    
+    // From IOKit/pwr_mgt/IOPM.h; the kIOPMMessageClamshellStateChange macro isn't imported into Swift.
+    static let clamshellStateChangeMessage: UInt32 = 0xE003_4100
+    static let clamshellStateBit = 1 << 0 // kClamshellStateBit
+    
     // Configurable hooks for testing / dependency injection
     var clamshellReader: () -> Bool
     var displaySleeper: () -> Void
@@ -62,20 +76,45 @@ public class LidLatchManager {
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
         
+        // Keep App Nap from coalescing the 10ms poll timer. Idle system sleep stays allowed.
+        pollActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Polling lid sensor for brief clamshell transitions"
+        )
+        
+        // Subscribe to kernel clamshell messages, which report every transition,
+        // including ones that flip back before the next poll.
+        startClamshellNotifications()
+        
         // 2. Monitor for a global keypress to wake the screen back up
         // Note: Requires Accessibility permissions if running entirely in the background
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] _ in
             self?.handleKeyPress()
         }
         
-        NSLog("[DisplaySleeper] Started monitoring lid state and keyboard events.")
-        print("[DisplaySleeper] Started monitoring lid state and keyboard events.")
-        fflush(stdout)
+        log("Started monitoring lid state and keyboard events.")
     }
     
     public func stopMonitoring() {
         pollTimer?.invalidate()
         pollTimer = nil
+        
+        if let activity = pollActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            pollActivity = nil
+        }
+        if clamshellNotifier != 0 {
+            IOObjectRelease(clamshellNotifier)
+            clamshellNotifier = 0
+        }
+        if let port = clamshellNotifyPort {
+            IONotificationPortDestroy(port)
+            clamshellNotifyPort = nil
+        }
+        if rootDomainService != 0 {
+            IOObjectRelease(rootDomainService)
+            rootDomainService = 0
+        }
         
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
@@ -86,8 +125,79 @@ public class LidLatchManager {
         fflush(stdout)
     }
     
+    private func startClamshellNotifications() {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else {
+            log("Could not find IOPMrootDomain; relying on polling only.")
+            return
+        }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            IOObjectRelease(service)
+            log("Could not create IOKit notification port; relying on polling only.")
+            return
+        }
+        CFRunLoopAddSource(
+            CFRunLoopGetMain(),
+            IONotificationPortGetRunLoopSource(port).takeUnretainedValue(),
+            .commonModes
+        )
+        
+        var notifier: io_object_t = 0
+        let result = IOServiceAddInterestNotification(
+            port,
+            service,
+            "IOGeneralInterest",
+            { refcon, _, messageType, messageArgument in
+                guard let refcon = refcon else { return }
+                let manager = Unmanaged<LidLatchManager>.fromOpaque(refcon).takeUnretainedValue()
+                manager.handlePowerMessage(messageType, argument: Int(bitPattern: messageArgument))
+            },
+            Unmanaged.passUnretained(self).toOpaque(),
+            &notifier
+        )
+        guard result == KERN_SUCCESS else {
+            IONotificationPortDestroy(port)
+            IOObjectRelease(service)
+            log(String(format: "IOServiceAddInterestNotification failed (0x%x); relying on polling only.", result))
+            return
+        }
+        
+        rootDomainService = service
+        clamshellNotifyPort = port
+        clamshellNotifier = notifier
+        log("Subscribed to clamshell state change notifications.")
+    }
+    
+    /// Handles an IOPMrootDomain interest message. The kernel sends one message per
+    /// clamshell transition, so a fast close that flips back before the next poll is still seen.
+    public func handlePowerMessage(_ messageType: UInt32, argument: Int) {
+        guard messageType == LidLatchManager.clamshellStateChangeMessage else { return }
+        let closed = (argument & LidLatchManager.clamshellStateBit) != 0
+        let polled = clamshellReader()
+        log("[event] Clamshell \(closed ? "CLOSED" : "OPEN") (poll reads \(polled ? "CLOSED" : "OPEN"), latched: \(userIntendsToClose)).")
+        processLidReading(closed)
+    }
+    
     public func checkLidState() {
         let lidIsCurrentlyClosed = clamshellReader()
+        let now = clock()
+        
+        if let lastPoll = lastPollTime, now.timeIntervalSince(lastPoll) > 0.05 {
+            log(String(format: "[poll] Poll gap of %.0fms (timer delayed or system slept).", now.timeIntervalSince(lastPoll) * 1000))
+        }
+        lastPollTime = now
+        if lidIsCurrentlyClosed != lastPolledState {
+            if lastPolledState != nil {
+                log("[poll] Sensor now reads \(lidIsCurrentlyClosed ? "CLOSED" : "OPEN").")
+            }
+            lastPolledState = lidIsCurrentlyClosed
+        }
+        
+        processLidReading(lidIsCurrentlyClosed)
+    }
+    
+    /// Runs the latch state machine on one sensor reading, from either the poll or a clamshell message.
+    func processLidReading(_ lidIsCurrentlyClosed: Bool) {
         let now = clock()
         
         // 1. User Input Wake Check:
@@ -168,6 +278,12 @@ public class LidLatchManager {
             fflush(stdout)
             wakeTrigger()
         }
+    }
+    
+    private func log(_ message: String) {
+        NSLog("[DisplaySleeper] %@", message)
+        print("[DisplaySleeper] \(message)")
+        fflush(stdout)
     }
     
     // MARK: - Default Hardware & System Calls

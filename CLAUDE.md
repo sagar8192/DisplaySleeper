@@ -22,12 +22,12 @@ Tests are a hand-rolled runner (no XCTest) using `assert`. To run a single test,
 ## Architecture
 
 - `main.swift` → `AppDelegate` (status bar menu, Accessibility prompt) → owns one `LidLatchManager`.
-- `LidLatchManager.swift` holds all logic. A 10ms `Timer` on the main run loop calls `checkLidState()`, which runs a small state machine over `userIntendsToClose` / `wasInOvershoot`:
+- `LidLatchManager.swift` holds all logic. Sensor readings come from two sources, both feeding `processLidReading(_:)` on the main run loop: a 10ms `Timer` polling `AppleClamshellState` (`checkLidState()`), and `kIOPMMessageClamshellStateChange` interest messages from `IOPMrootDomain` (`handlePowerMessage`). The messages report every transition, including fast-close blips that flip back before the next poll. A `ProcessInfo` activity keeps App Nap from throttling the timer. The state machine over `userIntendsToClose` / `wasInOvershoot` must stay idempotent for repeated identical readings, since both sources report the same transitions:
   - sensor `true` while unlatched → trip latch, call `displaySleeper()` (suppressed for 2s after a release, since opening the lid passes back through the sensor zone)
   - sensor `false` while latched → overshoot; re-call `displaySleeper()` at most once per 1.0s (`lastSleepCallTime`)
   - sensor `true` while latched *and* after an overshoot → lid is being opened; release latch and call `wakeTrigger()`
   - while latched (>1s after trip), recent key/flags/click activity from `CGEventSource.secondsSinceLastEventType` (no Accessibility permission needed) releases the latch via `handleKeyPress()`; an `NSEvent` global keyDown monitor does the same when Accessibility is granted.
-- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `clock`, `inputIdleReader`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / `CGEventSource` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handleKeyPress()` manually, moving time forward with `advanceTime(by:)`.
+- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `clock`, `inputIdleReader`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / `CGEventSource` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handlePowerMessage(_:argument:)` / `handleKeyPress()` manually, moving time forward with `advanceTime(by:)`.
 
 ## Constraints and gotchas
 

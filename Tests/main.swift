@@ -29,7 +29,9 @@ class LidLatchManagerTests {
         testKeyPressWakeOverride()
         testKeyPressWhenAlreadyAwake()
         testStopMonitoringAndDeinit()
-        print("All 8 tests passed successfully!")
+        testFastCloseCaughtByClamshellMessage()
+        testUnrelatedPowerMessageIgnored()
+        print("All 10 tests passed successfully!")
     }
     
     func createTestManager() -> LidLatchManager {
@@ -175,6 +177,43 @@ class LidLatchManagerTests {
         manager = nil
         assert(manager == nil)
         print("  ✓ testStopMonitoringAndDeinit passed")
+    }
+    
+    func testFastCloseCaughtByClamshellMessage() {
+        setUp()
+        let manager = createTestManager()
+        let closedMessage = LidLatchManager.clamshellStateBit
+        
+        // Lid slams shut: the sensor blips CLOSED and back to OPEN between two polls,
+        // so polling alone only ever reads OPEN.
+        simulatedClamshellState = false
+        manager.checkLidState()
+        assert(!manager.userIntendsToClose)
+        
+        // The kernel reports both transitions as messages.
+        manager.handlePowerMessage(LidLatchManager.clamshellStateChangeMessage, argument: closedMessage)
+        assert(manager.userIntendsToClose, "Clamshell CLOSED message must trip the latch")
+        assert(sleepCallCount == 1, "forceDisplaySleep must be called on the CLOSED message")
+        
+        manager.handlePowerMessage(LidLatchManager.clamshellStateChangeMessage, argument: 0)
+        assert(manager.userIntendsToClose, "Clamshell OPEN message right after close is an overshoot")
+        
+        // The poll keeps enforcing sleep through the overshoot.
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 2, "Overshoot must keep enforcing sleep after a message-tripped latch")
+        print("  ✓ testFastCloseCaughtByClamshellMessage passed")
+    }
+    
+    func testUnrelatedPowerMessageIgnored() {
+        setUp()
+        let manager = createTestManager()
+        
+        manager.handlePowerMessage(0xE000_0280, argument: LidLatchManager.clamshellStateBit) // kIOMessageSystemWillSleep
+        assert(!manager.userIntendsToClose, "Non-clamshell power messages must not trip the latch")
+        assert(sleepCallCount == 0)
+        print("  ✓ testUnrelatedPowerMessageIgnored passed")
     }
 }
 

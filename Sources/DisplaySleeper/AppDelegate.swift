@@ -4,6 +4,7 @@ import ApplicationServices
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var lidLatchManager: LidLatchManager?
     private var statusItem: NSStatusItem?
+    private var workspaceObservers: [NSObjectProtocol] = []
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[DisplaySleeper] Application launched in background mode (LSUIElement).")
@@ -12,6 +13,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupStatusItem()
         checkAccessibilityPermissions()
+        observeWorkspaceSleepEvents()
         
         // Initialize and start the LidLatchManager
         lidLatchManager = LidLatchManager()
@@ -70,6 +72,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         fflush(stdout)
         lidLatchManager?.stopMonitoring()
         lidLatchManager = nil
+    }
+    
+    // Diagnostics: log when macOS turns the screens or system off/on, to correlate with lid events.
+    private func observeWorkspaceSleepEvents() {
+        let events: [(Notification.Name, String)] = [
+            (NSWorkspace.screensDidSleepNotification, "Screens did sleep."),
+            (NSWorkspace.screensDidWakeNotification, "Screens did wake."),
+            (NSWorkspace.willSleepNotification, "System will sleep."),
+            (NSWorkspace.didWakeNotification, "System did wake."),
+        ]
+        let center = NSWorkspace.shared.notificationCenter
+        for (name, message) in events {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                NSLog("[DisplaySleeper] [workspace] %@", message)
+                print("[DisplaySleeper] [workspace] \(message)")
+                fflush(stdout)
+            }
+            workspaceObservers.append(observer)
+        }
     }
     
     private func checkAccessibilityPermissions() {
