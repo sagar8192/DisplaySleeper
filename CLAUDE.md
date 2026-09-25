@@ -26,8 +26,9 @@ Tests are a hand-rolled runner (no XCTest) using `assert`. To run a single test,
   - sensor `true` while unlatched → trip latch, call `displaySleeper()` (suppressed for 2s after a release, since opening the lid passes back through the sensor zone)
   - sensor `false` while latched → overshoot; re-call `displaySleeper()` at most once per 1.0s (`lastSleepCallTime`)
   - sensor `true` while latched *and* after an overshoot → lid is being opened; release latch and call `wakeTrigger()`
+  - resuming from sleep while latched (a >5s gap between readings): the sensor reads `false` whether the lid is flush or was opened while asleep, so overshoot enforcement is held. A full wake (`NSWorkspace.didWakeNotification`) extends the hold to 30s for the user to unlock (`com.apple.screenIsUnlocked`) or press a key. DarkWakes don't post that notification, so enforcement resumes after 5s.
   - while latched (>1s after trip), recent key/flags/click activity from `CGEventSource.secondsSinceLastEventType` (no Accessibility permission needed) releases the latch via `handleKeyPress()`; an `NSEvent` global keyDown monitor does the same when Accessibility is granted.
-- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `clock`, `inputIdleReader`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / `CGEventSource` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handlePowerMessage(_:argument:)` / `handleKeyPress()` manually, moving time forward with `advanceTime(by:)`.
+- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `clock`, `inputIdleReader`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / `CGEventSource` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handlePowerMessage(_:argument:)` / `handleSystemDidWake()` / `handleScreenUnlocked()` / `handleKeyPress()` manually, moving time forward with `advanceTime(by:)`.
 
 ## Constraints and gotchas
 

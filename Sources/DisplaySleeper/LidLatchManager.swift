@@ -13,6 +13,20 @@ public class LidLatchManager {
     private var lastSleepCallTime: Date?
     private var wasInOvershoot = false
     
+    // Wake handling: after resuming from sleep while latched, overshoot readings don't
+    // force sleep until this time, giving a full (user) wake the chance to release the latch.
+    private var enforcementHoldUntil: Date?
+    private var lastReadingTime: Date?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var unlockObserver: NSObjectProtocol?
+    
+    /// A gap this long between sensor readings means the process was suspended, i.e. the system slept.
+    static let resumeGapThreshold: TimeInterval = 5.0
+    /// After a resume, how long to wait for a full-wake notification before treating it as a DarkWake.
+    static let resumeSettlePeriod: TimeInterval = 5.0
+    /// After a full wake while latched, how long the user has to unlock or press a key before sleep is re-enforced.
+    static let wakeGracePeriod: TimeInterval = 30.0
+    
     // Clamshell change notifications (catch transitions shorter than the poll interval)
     private var rootDomainService: io_service_t = 0
     private var clamshellNotifyPort: IONotificationPortRef?
@@ -86,6 +100,20 @@ public class LidLatchManager {
         // including ones that flip back before the next poll.
         startClamshellNotifications()
         
+        // Full (user-visible) wakes and screen unlocks are signals that the lid is really open.
+        // DarkWake maintenance wakes don't post didWakeNotification.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleSystemDidWake()
+        })
+        unlockObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenUnlocked()
+        }
+        
         // 2. Monitor for a global keypress to wake the screen back up
         // Note: Requires Accessibility permissions if running entirely in the background
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] _ in
@@ -114,6 +142,15 @@ public class LidLatchManager {
         if rootDomainService != 0 {
             IOObjectRelease(rootDomainService)
             rootDomainService = 0
+        }
+        
+        for observer in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        workspaceObservers.removeAll()
+        if let observer = unlockObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+            unlockObserver = nil
         }
         
         if let monitor = keyMonitor {
@@ -200,6 +237,19 @@ public class LidLatchManager {
     func processLidReading(_ lidIsCurrentlyClosed: Bool) {
         let now = clock()
         
+        // 0. Resume Detection:
+        // Readings arrive every 10ms while awake, so a long gap means we just resumed from sleep.
+        // Opening the lid wakes the Mac *after* the lid has passed the sensor zone, so the sensor
+        // reads OPEN exactly like an overshoot. Hold off enforcing sleep until we know whether
+        // this is a full wake (the user) or a DarkWake (maintenance).
+        if userIntendsToClose, let lastReading = lastReadingTime,
+           now.timeIntervalSince(lastReading) > LidLatchManager.resumeGapThreshold {
+            extendEnforcementHold(until: now.addingTimeInterval(LidLatchManager.resumeSettlePeriod))
+            log(String(format: "Resumed after %.0fs while latched. Holding sleep enforcement for %.0fs to check for a full wake.",
+                       now.timeIntervalSince(lastReading), LidLatchManager.resumeSettlePeriod))
+        }
+        lastReadingTime = now
+        
         // 1. User Input Wake Check:
         // Check if user pressed a key or clicked without needing Accessibility permissions.
         if userIntendsToClose {
@@ -228,6 +278,7 @@ public class LidLatchManager {
             lastSleepCallTime = now
             latchReleasedTime = nil
             wasInOvershoot = false
+            enforcementHoldUntil = nil
             NSLog("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
             print("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
             fflush(stdout)
@@ -236,6 +287,14 @@ public class LidLatchManager {
             // OVERSHOOT DETECTED: The lid went completely flush, turning the flag back to 'No'.
             // Enforce true system sleep.
             wasInOvershoot = true
+            if let holdUntil = enforcementHoldUntil {
+                if now < holdUntil {
+                    return
+                }
+                enforcementHoldUntil = nil
+                log("No unlock or user input after wake. Re-enforcing system sleep.")
+                lastSleepCallTime = nil
+            }
             if lastSleepCallTime == nil || now.timeIntervalSince(lastSleepCallTime!) >= 1.0 {
                 lastSleepCallTime = now
                 let durationStr: String
@@ -253,31 +312,42 @@ public class LidLatchManager {
         } else if lidIsCurrentlyClosed && userIntendsToClose && wasInOvershoot {
             // SENSOR HIT TRUE AFTER OVERSHOOT: The lid was flush closed (overshoot) and is now
             // passing back through the 1-2 inch sensor zone as the user lifts it open!
-            userIntendsToClose = false
-            wasInOvershoot = false
-            latchTrippedTime = nil
-            lastSleepCallTime = nil
-            latchReleasedTime = now
-            NSLog("[DisplaySleeper] Lid opening detected (sensor transitioned to True from overshoot). Releasing display lock.")
-            print("[DisplaySleeper] Lid opening detected. Releasing display lock.")
-            fflush(stdout)
-            wakeTrigger()
+            releaseLatch(reason: "Lid opening detected (sensor transitioned to True from overshoot).")
         }
     }
     
     public func handleKeyPress() {
-        if userIntendsToClose {
-            // RESET LATCH: User pressed a key, meaning they want the Mac awake
-            userIntendsToClose = false
-            wasInOvershoot = false
-            latchTrippedTime = nil
-            lastSleepCallTime = nil
-            latchReleasedTime = clock()
-            NSLog("[DisplaySleeper] Keypress detected. Releasing display lock.")
-            print("[DisplaySleeper] Keypress detected. Releasing display lock.")
-            fflush(stdout)
-            wakeTrigger()
-        }
+        // RESET LATCH: User pressed a key, meaning they want the Mac awake
+        releaseLatch(reason: "Keypress detected.")
+    }
+    
+    /// Called on a full (user-visible) system wake. DarkWake maintenance wakes don't trigger this.
+    public func handleSystemDidWake() {
+        guard userIntendsToClose else { return }
+        extendEnforcementHold(until: clock().addingTimeInterval(LidLatchManager.wakeGracePeriod))
+        log(String(format: "Full system wake while latched. Holding sleep enforcement for %.0fs; unlock or press a key to release.",
+                   LidLatchManager.wakeGracePeriod))
+    }
+    
+    public func handleScreenUnlocked() {
+        releaseLatch(reason: "Screen unlocked.")
+    }
+    
+    private func extendEnforcementHold(until date: Date) {
+        if let current = enforcementHoldUntil, current > date { return }
+        enforcementHoldUntil = date
+    }
+    
+    private func releaseLatch(reason: String) {
+        guard userIntendsToClose else { return }
+        userIntendsToClose = false
+        wasInOvershoot = false
+        latchTrippedTime = nil
+        lastSleepCallTime = nil
+        enforcementHoldUntil = nil
+        latchReleasedTime = clock()
+        log("\(reason) Releasing display lock.")
+        wakeTrigger()
     }
     
     private func log(_ message: String) {

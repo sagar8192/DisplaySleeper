@@ -31,7 +31,11 @@ class LidLatchManagerTests {
         testStopMonitoringAndDeinit()
         testFastCloseCaughtByClamshellMessage()
         testUnrelatedPowerMessageIgnored()
-        print("All 10 tests passed successfully!")
+        testDarkWakeResumesEnforcementAfterSettle()
+        testFullWakeGraceReleasesOnInput()
+        testFullWakeGraceExpiresWithoutInput()
+        testScreenUnlockReleasesLatch()
+        print("All 14 tests passed successfully!")
     }
     
     func createTestManager() -> LidLatchManager {
@@ -214,6 +218,101 @@ class LidLatchManagerTests {
         assert(!manager.userIntendsToClose, "Non-clamshell power messages must not trip the latch")
         assert(sleepCallCount == 0)
         print("  ✓ testUnrelatedPowerMessageIgnored passed")
+    }
+    
+    /// Latches, goes through overshoot, and "sleeps" for an hour (no readings), then resumes with the sensor OPEN.
+    func createManagerResumedFromSleep() -> LidLatchManager {
+        let manager = createTestManager()
+        simulatedClamshellState = true
+        manager.checkLidState()
+        simulatedClamshellState = false
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 2)
+        
+        // System sleeps for an hour; on resume the sensor reads OPEN (lid open, or overshoot)
+        advanceTime(by: 3600)
+        manager.checkLidState()
+        return manager
+    }
+    
+    func testDarkWakeResumesEnforcementAfterSettle() {
+        setUp()
+        let manager = createManagerResumedFromSleep()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 2, "Sleep must not be forced immediately on resume")
+        
+        // No full-wake notification arrives (DarkWake). Still held within the settle period.
+        advanceTime(by: 4.0)
+        manager.checkLidState()
+        assert(sleepCallCount == 2, "Sleep must be held during the resume settle period")
+        
+        // Settle period over: back to enforcing sleep.
+        advanceTime(by: 1.5)
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 3, "Sleep must be re-enforced after a DarkWake settle period")
+        print("  ✓ testDarkWakeResumesEnforcementAfterSettle passed")
+    }
+    
+    func testFullWakeGraceReleasesOnInput() {
+        setUp()
+        let manager = createManagerResumedFromSleep()
+        manager.handleSystemDidWake()
+        
+        // Well past the settle period, still within the full-wake grace period.
+        for _ in 0..<5 {
+            advanceTime(by: 3.0)
+            manager.checkLidState()
+        }
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 2, "Sleep must be held during the full-wake grace period")
+        
+        // User types their password
+        simulatedInputIdle = 0.1
+        advanceTime(by: 0.01)
+        manager.checkLidState()
+        assert(!manager.userIntendsToClose, "User input during the grace period must release the latch")
+        assert(wakeCallCount == 1)
+        assert(sleepCallCount == 2)
+        print("  ✓ testFullWakeGraceReleasesOnInput passed")
+    }
+    
+    func testFullWakeGraceExpiresWithoutInput() {
+        setUp()
+        let manager = createManagerResumedFromSleep()
+        manager.handleSystemDidWake()
+        
+        // 27s after wake: still held
+        for _ in 0..<9 {
+            advanceTime(by: 3.0)
+            manager.checkLidState()
+        }
+        assert(sleepCallCount == 2, "Sleep must be held during the full-wake grace period")
+        
+        // 30s after wake with no unlock or input: re-enforce sleep
+        advanceTime(by: 3.0)
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 3, "Sleep must be re-enforced once the grace period expires")
+        print("  ✓ testFullWakeGraceExpiresWithoutInput passed")
+    }
+    
+    func testScreenUnlockReleasesLatch() {
+        setUp()
+        let manager = createManagerResumedFromSleep()
+        manager.handleSystemDidWake()
+        
+        manager.handleScreenUnlocked()
+        assert(!manager.userIntendsToClose, "Screen unlock must release the latch")
+        assert(wakeCallCount == 1)
+        
+        // Lid is open and reads OPEN: no more sleep calls
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(sleepCallCount == 2)
+        print("  ✓ testScreenUnlockReleasesLatch passed")
     }
 }
 
