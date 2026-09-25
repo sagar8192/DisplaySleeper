@@ -4,11 +4,19 @@ class LidLatchManagerTests {
     var sleepCallCount = 0
     var wakeCallCount = 0
     var simulatedClamshellState = false
+    var simulatedNow = Date(timeIntervalSinceReferenceDate: 0)
+    var simulatedInputIdle: TimeInterval = .infinity
     
     func setUp() {
         sleepCallCount = 0
         wakeCallCount = 0
         simulatedClamshellState = false
+        simulatedNow = Date(timeIntervalSinceReferenceDate: 0)
+        simulatedInputIdle = .infinity
+    }
+    
+    func advanceTime(by seconds: TimeInterval) {
+        simulatedNow = simulatedNow.addingTimeInterval(seconds)
     }
     
     func runAll() {
@@ -29,7 +37,9 @@ class LidLatchManagerTests {
             autoStart: false,
             clamshellReader: { [unowned self] in self.simulatedClamshellState },
             displaySleeper: { [unowned self] in self.sleepCallCount += 1 },
-            wakeTrigger: { [unowned self] in self.wakeCallCount += 1 }
+            wakeTrigger: { [unowned self] in self.wakeCallCount += 1 },
+            clock: { [unowned self] in self.simulatedNow },
+            inputIdleReader: { [unowned self] in self.simulatedInputIdle }
         )
     }
     
@@ -65,14 +75,27 @@ class LidLatchManagerTests {
         assert(manager.userIntendsToClose)
         assert(sleepCallCount == 1)
         
-        // 2. Hardware overshoot: lid closes completely flush, sensor drops to false
+        // 2. Hardware overshoot: lid closes completely flush, sensor drops to false.
+        // Within 1.0s of the latch-trip sleep call, re-sleeping is throttled.
         simulatedClamshellState = false
         manager.checkLidState()
         
         assert(manager.userIntendsToClose, "userIntendsToClose must remain true during overshoot")
+        assert(sleepCallCount == 1, "forceDisplaySleep must be paced at 1.0s after the latch-trip call")
+        
+        // 3. Once 1.0s has passed, the overshoot re-enforces sleep
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(manager.userIntendsToClose)
         assert(sleepCallCount == 2, "forceDisplaySleep must be called during overshoot to force blank screen")
         
-        // 3. Next poll during overshoot
+        // 4. Polls within the next 1.0s are throttled
+        advanceTime(by: 0.5)
+        manager.checkLidState()
+        assert(sleepCallCount == 2, "forceDisplaySleep must not be called again within 1.0s")
+        
+        // 5. Continued overshoot keeps re-enforcing sleep at the 1.0s pace
+        advanceTime(by: 0.5)
         manager.checkLidState()
         assert(manager.userIntendsToClose)
         assert(sleepCallCount == 3, "forceDisplaySleep must be called continuously during overshoot")
@@ -116,9 +139,11 @@ class LidLatchManagerTests {
         // Put into overshoot latch state
         simulatedClamshellState = true
         manager.checkLidState()
+        advanceTime(by: 1.0)
         simulatedClamshellState = false
         manager.checkLidState()
         assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 2)
         
         // Keypress intercepted
         manager.handleKeyPress()

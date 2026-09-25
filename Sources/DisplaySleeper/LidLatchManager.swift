@@ -17,15 +17,21 @@ public class LidLatchManager {
     var clamshellReader: () -> Bool
     var displaySleeper: () -> Void
     var wakeTrigger: () -> Void
+    var clock: () -> Date
+    var inputIdleReader: () -> TimeInterval
     
     public init(
         autoStart: Bool = true,
         dryRun: Bool = false,
         clamshellReader: (() -> Bool)? = nil,
         displaySleeper: (() -> Void)? = nil,
-        wakeTrigger: (() -> Void)? = nil
+        wakeTrigger: (() -> Void)? = nil,
+        clock: (() -> Date)? = nil,
+        inputIdleReader: (() -> TimeInterval)? = nil
     ) {
         self.clamshellReader = clamshellReader ?? LidLatchManager.defaultReadHardwareLidFlag
+        self.clock = clock ?? { Date() }
+        self.inputIdleReader = inputIdleReader ?? LidLatchManager.defaultSecondsSinceLastUserInput
 
         if dryRun {
             self.displaySleeper = {
@@ -82,20 +88,16 @@ public class LidLatchManager {
     
     public func checkLidState() {
         let lidIsCurrentlyClosed = clamshellReader()
+        let now = clock()
         
         // 1. User Input Wake Check:
         // Check if user pressed a key or clicked without needing Accessibility permissions.
         if userIntendsToClose {
-            if let latchTime = latchTrippedTime, Date().timeIntervalSince(latchTime) > 1.0 {
-                let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
-                let flagsIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .flagsChanged)
-                let clickIdle = min(
-                    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .leftMouseDown),
-                    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .rightMouseDown)
-                )
+            if let latchTime = latchTrippedTime, now.timeIntervalSince(latchTime) > 1.0 {
+                let inputIdle = inputIdleReader()
                 
-                if keyIdle < 0.8 || flagsIdle < 0.8 || clickIdle < 0.8 {
-                    NSLog("[DisplaySleeper] User input detected via CGEventSource (keyIdle: %.2fs, clickIdle: %.2fs). Releasing latch.", keyIdle, clickIdle)
+                if inputIdle < 0.8 {
+                    NSLog("[DisplaySleeper] User input detected via CGEventSource (idle: %.2fs). Releasing latch.", inputIdle)
                     print("[DisplaySleeper] User input detected. Releasing display lock.")
                     fflush(stdout)
                     handleKeyPress()
@@ -108,12 +110,12 @@ public class LidLatchManager {
         if lidIsCurrentlyClosed && !userIntendsToClose {
             // LATCH TRIPPED: The user closed the lid 1-2 inches, triggering the sensor.
             // Suppress re-latching for 2s after a release (lid passes through sensor zone on opening).
-            if let releasedTime = latchReleasedTime, Date().timeIntervalSince(releasedTime) < 2.0 {
+            if let releasedTime = latchReleasedTime, now.timeIntervalSince(releasedTime) < 2.0 {
                 return
             }
             userIntendsToClose = true
-            latchTrippedTime = Date()
-            lastSleepCallTime = Date()
+            latchTrippedTime = now
+            lastSleepCallTime = now
             latchReleasedTime = nil
             wasInOvershoot = false
             NSLog("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
@@ -124,7 +126,6 @@ public class LidLatchManager {
             // OVERSHOOT DETECTED: The lid went completely flush, turning the flag back to 'No'.
             // Enforce true system sleep.
             wasInOvershoot = true
-            let now = Date()
             if lastSleepCallTime == nil || now.timeIntervalSince(lastSleepCallTime!) >= 1.0 {
                 lastSleepCallTime = now
                 let durationStr: String
@@ -146,7 +147,7 @@ public class LidLatchManager {
             wasInOvershoot = false
             latchTrippedTime = nil
             lastSleepCallTime = nil
-            latchReleasedTime = Date()
+            latchReleasedTime = now
             NSLog("[DisplaySleeper] Lid opening detected (sensor transitioned to True from overshoot). Releasing display lock.")
             print("[DisplaySleeper] Lid opening detected. Releasing display lock.")
             fflush(stdout)
@@ -161,7 +162,7 @@ public class LidLatchManager {
             wasInOvershoot = false
             latchTrippedTime = nil
             lastSleepCallTime = nil
-            latchReleasedTime = Date()
+            latchReleasedTime = clock()
             NSLog("[DisplaySleeper] Keypress detected. Releasing display lock.")
             print("[DisplaySleeper] Keypress detected. Releasing display lock.")
             fflush(stdout)
@@ -189,6 +190,15 @@ public class LidLatchManager {
             return state
         }
         return false
+    }
+    
+    /// Seconds since the most recent keypress, modifier change, or mouse click.
+    /// Uses CGEventSource, which needs no Accessibility permission.
+    public static func defaultSecondsSinceLastUserInput() -> TimeInterval {
+        let eventTypes: [CGEventType] = [.keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown]
+        return eventTypes
+            .map { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) }
+            .min() ?? .infinity
     }
     
     public static func defaultForceDisplaySleep() {

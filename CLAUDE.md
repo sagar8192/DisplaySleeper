@@ -27,7 +27,7 @@ Tests are a hand-rolled runner (no XCTest) using `assert`. To run a single test,
   - sensor `false` while latched → overshoot; re-call `displaySleeper()` at most once per 1.0s (`lastSleepCallTime`)
   - sensor `true` while latched *and* after an overshoot → lid is being opened; release latch and call `wakeTrigger()`
   - while latched (>1s after trip), recent key/flags/click activity from `CGEventSource.secondsSinceLastEventType` (no Accessibility permission needed) releases the latch via `handleKeyPress()`; an `NSEvent` global keyDown monitor does the same when Accessibility is granted.
-- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handleKeyPress()` manually.
+- Side effects are injected through the init (`clamshellReader`, `displaySleeper`, `wakeTrigger`, `clock`, `inputIdleReader`, `autoStart`, `dryRun`); the static `default*` functions are the real IOKit / `pmset` / `CGEventSource` / synthetic-mouse-move implementations. Tests pass closures and `autoStart: false`, then drive `checkLidState()` / `handleKeyPress()` manually, moving time forward with `advanceTime(by:)`.
 
 ## Constraints and gotchas
 
@@ -35,5 +35,5 @@ Tests are a hand-rolled runner (no XCTest) using `assert`. To run a single test,
 - Tests read `userIntendsToClose` directly (it's `private(set)` internal), which works because both files are compiled into one module.
 - Logging convention: each message is emitted via both `NSLog` and `print` followed by `fflush(stdout)` — launchd redirects stdout/stderr to the log file, and the README relies on log gaps as proof of hardware sleep.
 - `Resources/com.custom.DisplaySleeper.plist` hardcodes absolute paths under `/Users/sagar/...` for the executable and log file; `install-daemon` copies it verbatim, so it only works for that path layout unless edited.
-- Time-based logic (1.0s sleep pacing, 1.0s input-check delay, 2.0s re-latch cooldown) uses `Date()` directly and isn't injectable, so tests that call `checkLidState()` back-to-back never cross these thresholds. Check tests against the current pacing when changing that logic — e.g. `testHardwareOvershootInterception` expects a sleep call on every overshoot poll, which the 1.0s throttle doesn't produce.
+- All time-based logic (1.0s sleep pacing, 1.0s input-check delay, 2.0s re-latch cooldown) must read time through `clock()`, not `Date()`, or it can't be tested. Tests default `inputIdleReader` to `.infinity`, so the real `CGEventSource` never sees a recent keypress (like the one that launched `make test`) and releases the latch.
 - Git history includes a reverted attempt at bag-wake protection (removing single-keypress disarm, SMC lid wake detection, triple-keypress override); see commits `267312f` / `b652035` before re-attempting similar changes.
