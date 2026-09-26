@@ -14,18 +14,15 @@ public class LidLatchManager {
     private var wasInOvershoot = false
     
     // Wake handling: after resuming from sleep while latched, overshoot readings don't
-    // force sleep until this time, giving a full (user) wake the chance to release the latch.
+    // force sleep until this time, giving a lid opening, unlock or keypress the chance to release the latch.
     private var enforcementHoldUntil: Date?
     private var lastReadingTime: Date?
-    private var workspaceObservers: [NSObjectProtocol] = []
     private var unlockObserver: NSObjectProtocol?
     
     /// A gap this long between sensor readings means the process was suspended, i.e. the system slept.
     static let resumeGapThreshold: TimeInterval = 5.0
-    /// After a resume, how long to wait for a full-wake notification before treating it as a DarkWake.
+    /// After a resume, how long to hold off re-enforcing sleep.
     static let resumeSettlePeriod: TimeInterval = 5.0
-    /// After a full wake while latched, how long the user has to unlock or press a key before sleep is re-enforced.
-    static let wakeGracePeriod: TimeInterval = 30.0
     
     // Clamshell change notifications (catch transitions shorter than the poll interval)
     private var rootDomainService: io_service_t = 0
@@ -100,14 +97,7 @@ public class LidLatchManager {
         // including ones that flip back before the next poll.
         startClamshellNotifications()
         
-        // Full (user-visible) wakes and screen unlocks are signals that the lid is really open.
-        // DarkWake maintenance wakes don't post didWakeNotification.
-        let workspaceCenter = NSWorkspace.shared.notificationCenter
-        workspaceObservers.append(workspaceCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.handleSystemDidWake()
-        })
+        // A screen unlock means the user has the lid open.
         unlockObserver = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
         ) { [weak self] _ in
@@ -144,10 +134,6 @@ public class LidLatchManager {
             rootDomainService = 0
         }
         
-        for observer in workspaceObservers {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
-        workspaceObservers.removeAll()
         if let observer = unlockObserver {
             DistributedNotificationCenter.default().removeObserver(observer)
             unlockObserver = nil
@@ -239,13 +225,15 @@ public class LidLatchManager {
         
         // 0. Resume Detection:
         // Readings arrive every 10ms while awake, so a long gap means we just resumed from sleep.
-        // Opening the lid wakes the Mac *after* the lid has passed the sensor zone, so the sensor
-        // reads OPEN exactly like an overshoot. Hold off enforcing sleep until we know whether
-        // this is a full wake (the user) or a DarkWake (maintenance).
+        // When the lid is opened, the Mac can wake before or after the lid clears the sensor zone;
+        // the kernel's queued clamshell CLOSED message for the zone pass may arrive shortly after
+        // resume. Briefly hold off enforcing sleep so that message, an unlock, or a keypress can
+        // release the latch. DarkWakes only ever report OPEN, so they're re-slept after the hold.
+        // Don't extend the hold on a full wake: the overshoot itself can cause one with the lid shut.
         if userIntendsToClose, let lastReading = lastReadingTime,
            now.timeIntervalSince(lastReading) > LidLatchManager.resumeGapThreshold {
-            extendEnforcementHold(until: now.addingTimeInterval(LidLatchManager.resumeSettlePeriod))
-            log(String(format: "Resumed after %.0fs while latched. Holding sleep enforcement for %.0fs to check for a full wake.",
+            enforcementHoldUntil = now.addingTimeInterval(LidLatchManager.resumeSettlePeriod)
+            log(String(format: "Resumed after %.0fs while latched. Holding sleep enforcement for %.0fs.",
                        now.timeIntervalSince(lastReading), LidLatchManager.resumeSettlePeriod))
         }
         lastReadingTime = now
@@ -292,7 +280,7 @@ public class LidLatchManager {
                     return
                 }
                 enforcementHoldUntil = nil
-                log("No unlock or user input after wake. Re-enforcing system sleep.")
+                log("No lid opening, unlock or user input after wake. Re-enforcing system sleep.")
                 lastSleepCallTime = nil
             }
             if lastSleepCallTime == nil || now.timeIntervalSince(lastSleepCallTime!) >= 1.0 {
@@ -300,7 +288,7 @@ public class LidLatchManager {
                 let durationStr: String
                 if let latchTime = latchTrippedTime {
                     let ms = now.timeIntervalSince(latchTime) * 1000
-                    durationStr = String(format: " (%.0fms in sensor zone)", ms)
+                    durationStr = String(format: " (%.0fms since latch)", ms)
                 } else {
                     durationStr = ""
                 }
@@ -321,21 +309,8 @@ public class LidLatchManager {
         releaseLatch(reason: "Keypress detected.")
     }
     
-    /// Called on a full (user-visible) system wake. DarkWake maintenance wakes don't trigger this.
-    public func handleSystemDidWake() {
-        guard userIntendsToClose else { return }
-        extendEnforcementHold(until: clock().addingTimeInterval(LidLatchManager.wakeGracePeriod))
-        log(String(format: "Full system wake while latched. Holding sleep enforcement for %.0fs; unlock or press a key to release.",
-                   LidLatchManager.wakeGracePeriod))
-    }
-    
     public func handleScreenUnlocked() {
         releaseLatch(reason: "Screen unlocked.")
-    }
-    
-    private func extendEnforcementHold(until date: Date) {
-        if let current = enforcementHoldUntil, current > date { return }
-        enforcementHoldUntil = date
     }
     
     private func releaseLatch(reason: String) {
