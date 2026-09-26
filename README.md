@@ -35,7 +35,7 @@ DisplaySleeper runs silently in your menu bar (`LSUIElement = true`) and acts as
               │                                 │
      [Lid Lifted Open]               [Hardware Overshoot]
      Sensor hits 1-2" (True)           Sensor flips: False
-     OR Keypress / Click             (Flush closed in bag)
+     OR Unlock / Key / Click         (Flush closed in bag)
               │                                 ▼
               │                        ┌────────────────┐
               │                        │  SYSTEM SLEEP  │
@@ -47,12 +47,13 @@ DisplaySleeper runs silently in your menu bar (`LSUIElement = true`) and acts as
 ```
 
 ### State Machine Lifecycle:
-1. **Latch Tripped**: When `AppleClamshellState` momentarily flips to `True` at 1–2", DisplaySleeper sets `userIntendsToClose = true` and invokes `/usr/bin/pmset sleepnow`.
-2. **Overshoot Interception**: When the lid reaches flush closed and the sensor falsely drops back to `False`, DisplaySleeper catches the overshoot and enforces `pmset sleepnow` (paced at 1.0s) until the system settles into deep sleep.
+1. **Latch Tripped**: When `AppleClamshellState` flips to `True` at 1–2", DisplaySleeper sets `userIntendsToClose = true` and invokes `/usr/bin/pmset sleepnow`. The sensor is watched two ways: a 10ms poll, and the kernel's clamshell-change notifications from `IOPMrootDomain`. The notifications report every transition, so even a fast close that flips the sensor for only a few milliseconds is caught.
+2. **Overshoot Interception**: When the lid reaches flush closed and the sensor falsely drops back to `False`, DisplaySleeper catches the overshoot and enforces `pmset sleepnow` (paced at 1.0s) until the system settles into deep sleep. If the overshoot itself wakes the Mac right after closing, it's put straight back to sleep.
 3. **True System Sleep**: The CPU halts, RAM refreshes in low-power mode, and the Mac sleeps cold (saving battery and eliminating heat).
-4. **Dual-Channel Wake**:
-   - **Automatic Lid-Lift**: As you open the lid, the magnet passes back through the 1–2" sweet spot (`False → True`). DisplaySleeper detects this upward motion and **immediately releases the lock**. A 2-second cooldown prevents re-latching while the lid swings open.
-   - **User Input Override**: If you open the lid quickly past the sensor zone, tapping any key or clicking the trackpad instantly releases the latch via low-level `CGEventSource` detection (no special permissions required).
+4. **Waking Back Up**: A flush-closed lid and an open lid both read `False`, so after any wake DisplaySleeper holds off for **5 seconds** and releases the latch only on a sign that you really opened it:
+   - **Automatic Lid-Lift**: As you open the lid, the magnet passes back through the 1–2" sweet spot (`False → True`). DisplaySleeper sees this (via the poll or the kernel's notification, which arrives just after the Mac wakes) and **immediately releases the lock**. A 2-second cooldown prevents re-latching while the lid swings open.
+   - **Unlock or User Input**: Unlocking the screen (Touch ID or password), pressing a key or clicking also releases the latch. Key and click detection uses `CGEventSource`, so no special permissions are required.
+   - **Otherwise**: Apple's background maintenance wakes (DarkWake), and wakes caused by bumping or peeking under the lid, never pass through the sensor zone, so the Mac goes back to sleep after the 5 seconds.
 
 ---
 
@@ -60,25 +61,28 @@ DisplaySleeper runs silently in your menu bar (`LSUIElement = true`) and acts as
 
 - 💻 **Menu Bar Icon (`NSStatusItem`)**: Clean laptop icon in your top menu bar with one-click **Status**, manual **Sleep System Now**, and **Quit**.
 - 💤 **True System Sleep (`pmset sleepnow`)**: Completely halts the CPU and powers down the display—just like a brand-new MacBook lid.
-- 🔁 **DarkWake Friendly**: Gracefully allows Apple's native ~17-minute maintenance cycles (Find My beacons, network keep-alives) to run for ~5 seconds before returning to deep sleep.
+- ⚡ **Fast-Close Detection**: Kernel clamshell notifications catch lid closes too quick for polling to see.
+- 🔁 **DarkWake Friendly**: Gracefully allows Apple's native ~15-minute maintenance cycles (Find My beacons, network keep-alives) to run for ~5 seconds before returning to deep sleep.
 - 🚀 **Autostart Daemon (`launchd`)**: Automatically launches on reboot and login via a native macOS LaunchAgent.
-- 🎯 **Double-Click from Applications**: Symlinked into `~/Applications/DisplaySleeper.app` so you can launch it from Finder or Spotlight at any time.
 - 🛡️ **Zero-Permission Fallback**: Uses CoreGraphics `CGEventSource` event timing to detect keypresses and trackpad clicks even if Accessibility permissions have not been granted.
 
 ---
 
 ## ⚡ Quick Start
 
-### 1. Build and Install the Daemon
-Clone the repository and run:
+### 1. Point the LaunchAgent at Your Checkout
+`Resources/com.custom.DisplaySleeper.plist` contains absolute paths for the app executable and the log file (`/Users/sagar/...`). Either clone the repository to `~/Applications/Mac Apps/DisplaySleeper` under the `sagar` account, or edit those three paths to match your username and checkout location.
+
+### 2. Build and Install the Daemon
+From the repository folder, run:
 
 ```bash
 make install-daemon
 ```
 
-This compiles the Swift application bundle, creates `~/Applications/DisplaySleeper.app`, installs the LaunchAgent plist, and starts the daemon immediately.
+This compiles and ad-hoc signs `DisplaySleeper.app` inside the repository folder, copies the LaunchAgent plist to `~/Library/LaunchAgents/`, and starts the daemon immediately. The app runs from the repository folder, so don't move or delete it.
 
-### 2. Verify It's Running
+### 3. Verify It's Running
 Look at your macOS top menu bar (near Wi-Fi and the clock)—you will see a **laptop icon** (💻).
 
 You can also check the daemon status in Terminal:
@@ -86,9 +90,11 @@ You can also check the daemon status in Terminal:
 make status-daemon
 ```
 
-### 3. Test the Lid
+### 4. Test the Lid
 1. **Close the lid**: As soon as it closes, the laptop will enter deep system sleep.
-2. **Open the lid**: The screen will wake back up automatically to your lock screen. (If needed, tap any key or click the trackpad).
+2. **Open the lid**: The screen will wake back up automatically to your lock screen. (If needed, unlock or tap any key within 5 seconds.)
+
+Lifting the lid just a crack to peek may briefly light the screen: macOS wakes the Mac before DisplaySleeper can react. Because the lid never reaches the sensor zone, DisplaySleeper keeps the latch and puts it back to sleep within about a second.
 
 ---
 
@@ -101,6 +107,7 @@ make status-daemon
 | `make logs` | Streams live application logs (`tail -f ~/Library/Logs/DisplaySleeper.log`) |
 | `make uninstall-daemon` | Stops and uninstalls the LaunchAgent from macOS |
 | `make build` | Compiles `DisplaySleeper.app` bundle locally |
+| `make run` | Builds and launches the app directly (without `launchd`) |
 | `make test` | Runs the automated state-machine test suite |
 | `make clean` | Removes build artifacts (`.build/` and `DisplaySleeper.app`) |
 
@@ -111,7 +118,11 @@ make status-daemon
 - **Check Status**: Click the laptop icon in the menu bar to verify that the daemon is active.
 - **Manual Sleep**: Select **Sleep System Now** to test sleep without closing the lid.
 - **Quit**: Select **Quit DisplaySleeper** to stop the daemon.
-- **Relaunching**: If you quit the app, simply open your **Applications** folder (`~/Applications` or Finder $\to$ Applications) and double-click **DisplaySleeper**.
+- **Relaunching**: Quitting stops the daemon until your next login. To start it again right away, run:
+  ```bash
+  launchctl kickstart gui/$(id -u)/com.custom.DisplaySleeper
+  ```
+  or double-click `DisplaySleeper.app` in the repository folder.
 
 ---
 
@@ -121,18 +132,23 @@ Want proof that your Mac stayed asleep in your bag for hours?
 
 ### Method 1: Check DisplaySleeper Logs (`make logs`)
 ```log
-10:59:31 [DisplaySleeper] Sleeping now...
-          💤 (Notice the multi-hour timestamp gap with ZERO logs)
-12:32:29 [DisplaySleeper] Lid opening detected. Releasing display lock.
+19:14:10 [DisplaySleeper] Lid latch activated. Enforcing system sleep.
+19:14:11 [DisplaySleeper] Hardware overshoot detected (1021ms since latch). Enforcing system sleep.
+          💤 (Gap: the Mac is asleep)
+19:30:04 [DisplaySleeper] Resumed after 907s while latched. Holding sleep enforcement for 5s.
+19:30:09 [DisplaySleeper] No lid opening, unlock or user input after wake. Re-enforcing system sleep.
+          💤 (Gap: a DarkWake came and went)
+21:05:17 [DisplaySleeper] Resumed after 727s while latched. Holding sleep enforcement for 5s.
+21:05:18 [DisplaySleeper] Lid opening detected (sensor transitioned to True from overshoot). Releasing display lock.
 ```
-Because DisplaySleeper runs a timer on the main thread, **zero logs during the gap proves the CPU was completely halted in hardware sleep.**
+Because DisplaySleeper runs a timer on the main thread, **gaps with zero logs prove the CPU was halted in hardware sleep.** A `Resumed … / Re-enforcing` pair roughly every 15 minutes is Apple's DarkWake maintenance cycle. During some DarkWakes, `Hardware overshoot detected` repeats every second for up to ~45s; that's harmless, as macOS finishes its maintenance before sleeping again.
 
 ### Method 2: macOS Native Power Management Log
-Run this command in Terminal to see Apple's internal power logs:
+Run this command in Terminal to see every sleep and wake with its cause:
 ```bash
-pmset -g stats
+pmset -g log | grep -E " (Sleep|Wake|DarkWake) "
 ```
-You will see cumulative sleep counts and confirmation of hardware sleep cycles.
+With the lid closed you should only see `Sleep` and `DarkWake` entries. A plain `Wake` line shows its cause after `due to`; opening the lid shows up as `lid`.
 
 ---
 
@@ -142,7 +158,7 @@ You will see cumulative sleep counts and confirmation of hardware sleep cycles.
 DisplaySleeper/
 ├── Sources/
 │   └── DisplaySleeper/
-│       ├── LidLatchManager.swift   # State machine, IORegistry polling, sleep trigger
+│       ├── LidLatchManager.swift   # State machine, lid polling & clamshell notifications, sleep trigger
 │       ├── AppDelegate.swift       # Menu bar icon, AppKit lifecycle, permissions
 │       └── main.swift              # AppKit entry point
 ├── Resources/
@@ -154,6 +170,7 @@ DisplaySleeper/
 │   ├── build.sh                    # Build and code-signing script
 │   └── run_tests.sh                # Test runner script
 ├── Makefile                        # Build, install, status, and log automation
+├── CLAUDE.md                       # Notes for AI coding assistants working on this repo
 └── README.md                       # Project documentation
 ```
 

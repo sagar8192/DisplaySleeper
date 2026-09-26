@@ -30,10 +30,6 @@ public class LidLatchManager {
     private var clamshellNotifier: io_object_t = 0
     private var pollActivity: NSObjectProtocol?
     
-    // Diagnostics
-    private var lastPolledState: Bool?
-    private var lastPollTime: Date?
-    
     // From IOKit/pwr_mgt/IOPM.h; the kIOPMMessageClamshellStateChange macro isn't imported into Swift.
     static let clamshellStateChangeMessage: UInt32 = 0xE003_4100
     static let clamshellStateBit = 1 << 0 // kClamshellStateBit
@@ -196,27 +192,11 @@ public class LidLatchManager {
     public func handlePowerMessage(_ messageType: UInt32, argument: Int) {
         guard messageType == LidLatchManager.clamshellStateChangeMessage else { return }
         let closed = (argument & LidLatchManager.clamshellStateBit) != 0
-        let polled = clamshellReader()
-        log("[event] Clamshell \(closed ? "CLOSED" : "OPEN") (poll reads \(polled ? "CLOSED" : "OPEN"), latched: \(userIntendsToClose)).")
         processLidReading(closed)
     }
     
     public func checkLidState() {
-        let lidIsCurrentlyClosed = clamshellReader()
-        let now = clock()
-        
-        if let lastPoll = lastPollTime, now.timeIntervalSince(lastPoll) > 0.25 {
-            log(String(format: "[poll] Poll gap of %.0fms (timer delayed or system slept).", now.timeIntervalSince(lastPoll) * 1000))
-        }
-        lastPollTime = now
-        if lidIsCurrentlyClosed != lastPolledState {
-            if lastPolledState != nil {
-                log("[poll] Sensor now reads \(lidIsCurrentlyClosed ? "CLOSED" : "OPEN").")
-            }
-            lastPolledState = lidIsCurrentlyClosed
-        }
-        
-        processLidReading(lidIsCurrentlyClosed)
+        processLidReading(clamshellReader())
     }
     
     /// Runs the latch state machine on one sensor reading, from either the poll or a clamshell message.
