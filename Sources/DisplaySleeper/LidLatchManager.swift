@@ -219,7 +219,7 @@ public class LidLatchManager {
         let lidIsCurrentlyClosed = clamshellReader()
         let now = clock()
         
-        if let lastPoll = lastPollTime, now.timeIntervalSince(lastPoll) > 0.05 {
+        if let lastPoll = lastPollTime, now.timeIntervalSince(lastPoll) > 0.25 {
             log(String(format: "[poll] Poll gap of %.0fms (timer delayed or system slept).", now.timeIntervalSince(lastPoll) * 1000))
         }
         lastPollTime = now
