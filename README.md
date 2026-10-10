@@ -17,6 +17,7 @@ So macOS thinks you reopened the lid: the screen turns on inside the closed lapt
 2. **Fully shut:** when the sensor falsely flips back to "open", DisplaySleeper ignores it and keeps putting the Mac to sleep.
 3. **Opening:** as you lift the lid, it passes back through the 1–2" zone, and DisplaySleeper lets the Mac wake normally.
 4. **Any other wake:** DisplaySleeper waits 5 seconds. If you open the lid, unlock, or press a key in that time, it lets the Mac stay awake. Otherwise it's a background or accidental wake, and the Mac goes back to sleep.
+5. **External monitor:** if a monitor is connected, closing the lid doesn't put the Mac to sleep, so you can keep working on the monitor. Unplug the monitor while the lid is closed and the Mac goes to sleep right away.
 
 ## ⚡ Install
 
@@ -46,6 +47,7 @@ No special permissions are needed. You may see an Accessibility permission promp
   - **You peek under the lid.** Lifting it a crack wakes the Mac, but the lid doesn't reach the 1–2" zone, so it goes straight back to sleep.
   - **You touch or press the closed laptop.** Because the faulty sensor tells macOS the lid is open, macOS leaves the built-in trackpad switched on under the closed lid. Pressing the lid shut, or gripping or moving the laptop, can register as trackpad touches, and each one briefly wakes the Mac. It settles once you put the laptop down.
 - **A firm press on the closed lid could register as a trackpad click.** DisplaySleeper treats a click as you using the Mac and lets it stay awake. If your Mac is ever warm in your bag, check the logs (below) for `User input detected`.
+- **With an external monitor connected, the Mac stays awake with the lid closed until you open the lid or unplug the monitor.** Typing or unlocking at your desk doesn't count as opening the lid. To sleep it at your desk, use **Sleep System Now** in the menu bar.
 - **Brief background wakes every ~15 minutes are normal.** Apple wakes the Mac without the screen for maintenance (Find My, network, etc.), usually for about 2 seconds.
 
 ## 📊 Checking It Worked

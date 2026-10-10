@@ -6,6 +6,7 @@ class LidLatchManagerTests {
     var simulatedClamshellState = false
     var simulatedNow = Date(timeIntervalSinceReferenceDate: 0)
     var simulatedInputIdle: TimeInterval = .infinity
+    var simulatedExternalDisplay = false
     
     func setUp() {
         sleepCallCount = 0
@@ -13,6 +14,7 @@ class LidLatchManagerTests {
         simulatedClamshellState = false
         simulatedNow = Date(timeIntervalSinceReferenceDate: 0)
         simulatedInputIdle = .infinity
+        simulatedExternalDisplay = false
     }
     
     func advanceTime(by seconds: TimeInterval) {
@@ -35,7 +37,11 @@ class LidLatchManagerTests {
         testLidOpenAfterResumeReleasesViaClamshellMessage()
         testInputDuringResumeHoldReleasesLatch()
         testScreenUnlockReleasesLatch()
-        print("All 14 tests passed successfully!")
+        testExternalDisplayKeepsMacAwakeWithLidClosed()
+        testInputWithExternalDisplayKeepsLatch()
+        testUnpluggingExternalDisplayEnforcesSleep()
+        testOpeningLidWithExternalDisplayReleasesLatch()
+        print("All 18 tests passed successfully!")
     }
     
     func createTestManager() -> LidLatchManager {
@@ -45,7 +51,8 @@ class LidLatchManagerTests {
             displaySleeper: { [unowned self] in self.sleepCallCount += 1 },
             wakeTrigger: { [unowned self] in self.wakeCallCount += 1 },
             clock: { [unowned self] in self.simulatedNow },
-            inputIdleReader: { [unowned self] in self.simulatedInputIdle }
+            inputIdleReader: { [unowned self] in self.simulatedInputIdle },
+            externalDisplayReader: { [unowned self] in self.simulatedExternalDisplay }
         )
     }
     
@@ -305,6 +312,88 @@ class LidLatchManagerTests {
         manager.checkLidState()
         assert(sleepCallCount == 2)
         print("  ✓ testScreenUnlockReleasesLatch passed")
+    }
+    
+    /// Closes the lid (latch trip, then flush overshoot) with an external display connected.
+    func createManagerClosedWithExternalDisplay() -> LidLatchManager {
+        simulatedExternalDisplay = true
+        let manager = createTestManager()
+        simulatedClamshellState = true
+        manager.checkLidState()
+        advanceTime(by: 1.0)
+        simulatedClamshellState = false
+        manager.checkLidState()
+        return manager
+    }
+    
+    func testExternalDisplayKeepsMacAwakeWithLidClosed() {
+        setUp()
+        let manager = createManagerClosedWithExternalDisplay()
+        assert(manager.userIntendsToClose, "Closing the lid must still trip the latch")
+        assert(sleepCallCount == 0, "Sleep must not be forced with an external display connected")
+        
+        for _ in 0..<10 {
+            advanceTime(by: 1.0)
+            manager.checkLidState()
+        }
+        assert(manager.userIntendsToClose)
+        assert(sleepCallCount == 0, "Sleep must stay suspended while the external display is connected")
+        print("  ✓ testExternalDisplayKeepsMacAwakeWithLidClosed passed")
+    }
+    
+    func testInputWithExternalDisplayKeepsLatch() {
+        setUp()
+        let manager = createManagerClosedWithExternalDisplay()
+        
+        // Working at the desk: typing, clicking and unlocking on the external display
+        advanceTime(by: 2.0)
+        simulatedInputIdle = 0.1
+        manager.checkLidState()
+        manager.handleKeyPress()
+        manager.handleScreenUnlocked()
+        assert(manager.userIntendsToClose, "Input with an external display must not release the latch")
+        assert(wakeCallCount == 0)
+        assert(sleepCallCount == 0)
+        print("  ✓ testInputWithExternalDisplayKeepsLatch passed")
+    }
+    
+    func testUnpluggingExternalDisplayEnforcesSleep() {
+        setUp()
+        let manager = createManagerClosedWithExternalDisplay()
+        
+        // User was typing just before unplugging the display and leaving with the lid closed.
+        simulatedInputIdle = 0.5
+        advanceTime(by: 0.25)
+        simulatedExternalDisplay = false
+        manager.checkLidState()
+        assert(manager.userIntendsToClose, "Input from before the unplug must not release the latch")
+        assert(sleepCallCount == 1, "Sleep must be forced as soon as the external display is unplugged")
+        
+        // Then back to the normal 1.0s enforcement pace
+        simulatedInputIdle = .infinity
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(sleepCallCount == 2)
+        print("  ✓ testUnpluggingExternalDisplayEnforcesSleep passed")
+    }
+    
+    func testOpeningLidWithExternalDisplayReleasesLatch() {
+        setUp()
+        let manager = createManagerClosedWithExternalDisplay()
+        
+        // Lid lifted at the desk: passes back through the sensor zone
+        advanceTime(by: 5.0)
+        simulatedClamshellState = true
+        manager.checkLidState()
+        assert(!manager.userIntendsToClose, "Opening the lid must release the latch with an external display")
+        assert(wakeCallCount == 1)
+        
+        // Lid fully open, display still connected: nothing to enforce
+        simulatedClamshellState = false
+        advanceTime(by: 1.0)
+        manager.checkLidState()
+        assert(sleepCallCount == 0)
+        print("  ✓ testOpeningLidWithExternalDisplayReleasesLatch passed")
     }
 }
 

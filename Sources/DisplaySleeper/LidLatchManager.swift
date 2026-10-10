@@ -19,6 +19,11 @@ public class LidLatchManager {
     private var lastReadingTime: Date?
     private var unlockObserver: NSObjectProtocol?
     
+    // External display (clamshell mode): while one is connected, the latch is still tracked but
+    // sleep isn't forced, so the Mac keeps working with the lid closed. Unplugging it re-enforces sleep.
+    private var sleepSuspendedForExternalDisplay = false
+    private var externalDisplayLastSeen: Date?
+    
     /// A gap this long between sensor readings means the process was suspended, i.e. the system slept.
     static let resumeGapThreshold: TimeInterval = 5.0
     /// After a resume, how long to hold off re-enforcing sleep.
@@ -40,6 +45,7 @@ public class LidLatchManager {
     var wakeTrigger: () -> Void
     var clock: () -> Date
     var inputIdleReader: () -> TimeInterval
+    var externalDisplayReader: () -> Bool
     
     public init(
         autoStart: Bool = true,
@@ -48,11 +54,15 @@ public class LidLatchManager {
         displaySleeper: (() -> Void)? = nil,
         wakeTrigger: (() -> Void)? = nil,
         clock: (() -> Date)? = nil,
-        inputIdleReader: (() -> TimeInterval)? = nil
+        inputIdleReader: (() -> TimeInterval)? = nil,
+        externalDisplayReader: (() -> Bool)? = nil
     ) {
         self.clamshellReader = clamshellReader ?? LidLatchManager.defaultReadHardwareLidFlag
         self.clock = clock ?? { Date() }
         self.inputIdleReader = inputIdleReader ?? LidLatchManager.defaultSecondsSinceLastUserInput
+        // Readings arrive at 100Hz; the display list only needs checking a couple of times a second.
+        self.externalDisplayReader = externalDisplayReader
+            ?? LidLatchManager.cached(LidLatchManager.defaultExternalDisplayConnected, interval: 0.5)
 
         if dryRun {
             self.displaySleeper = {
@@ -218,13 +228,22 @@ public class LidLatchManager {
         }
         lastReadingTime = now
         
+        // External display check, only needed while closing or latched.
+        let externalDisplay = (userIntendsToClose || lidIsCurrentlyClosed) && externalDisplayReader()
+        if externalDisplay {
+            externalDisplayLastSeen = now
+        }
+        
         // 1. User Input Wake Check:
         // Check if user pressed a key or clicked without needing Accessibility permissions.
-        if userIntendsToClose {
+        // With an external display connected, input is normal clamshell-mode use, not a sign the lid
+        // is open; input from before the display was unplugged doesn't count either.
+        if userIntendsToClose && !externalDisplay {
             if let latchTime = latchTrippedTime, now.timeIntervalSince(latchTime) > 1.0 {
                 let inputIdle = inputIdleReader()
+                let inputPredatesDisconnect = externalDisplayLastSeen.map { inputIdle >= now.timeIntervalSince($0) } ?? false
                 
-                if inputIdle < 0.8 {
+                if inputIdle < 0.8 && !inputPredatesDisconnect {
                     NSLog("[DisplaySleeper] User input detected via CGEventSource (idle: %.2fs). Releasing latch.", inputIdle)
                     print("[DisplaySleeper] User input detected. Releasing display lock.")
                     fflush(stdout)
@@ -247,14 +266,34 @@ public class LidLatchManager {
             latchReleasedTime = nil
             wasInOvershoot = false
             enforcementHoldUntil = nil
-            NSLog("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
-            print("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
-            fflush(stdout)
-            displaySleeper()
+            if externalDisplay {
+                sleepSuspendedForExternalDisplay = true
+                log("Lid latch activated. External display connected; not forcing sleep.")
+            } else {
+                externalDisplayLastSeen = nil
+                NSLog("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
+                print("[DisplaySleeper] Lid latch activated. Enforcing system sleep.")
+                fflush(stdout)
+                displaySleeper()
+            }
         } else if !lidIsCurrentlyClosed && userIntendsToClose {
             // OVERSHOOT DETECTED: The lid went completely flush, turning the flag back to 'No'.
             // Enforce true system sleep.
             wasInOvershoot = true
+            if externalDisplay {
+                if !sleepSuspendedForExternalDisplay {
+                    sleepSuspendedForExternalDisplay = true
+                    log("External display connected with the lid closed. Not forcing sleep.")
+                }
+                return
+            }
+            if sleepSuspendedForExternalDisplay {
+                // Unplugged with the lid closed (e.g. leaving the desk). Sleep now, unless we just
+                // resumed and are still waiting to see whether the lid is being opened.
+                sleepSuspendedForExternalDisplay = false
+                lastSleepCallTime = nil
+                log("External display disconnected with the lid closed. Enforcing system sleep.")
+            }
             if let holdUntil = enforcementHoldUntil {
                 if now < holdUntil {
                     return
@@ -285,11 +324,15 @@ public class LidLatchManager {
     }
     
     public func handleKeyPress() {
+        // With an external display connected, typing is normal clamshell-mode use.
+        if userIntendsToClose && externalDisplayReader() { return }
         // RESET LATCH: User pressed a key, meaning they want the Mac awake
         releaseLatch(reason: "Keypress detected.")
     }
     
     public func handleScreenUnlocked() {
+        // With an external display connected, unlocking is normal clamshell-mode use.
+        if userIntendsToClose && externalDisplayReader() { return }
         releaseLatch(reason: "Screen unlocked.")
     }
     
@@ -300,6 +343,8 @@ public class LidLatchManager {
         latchTrippedTime = nil
         lastSleepCallTime = nil
         enforcementHoldUntil = nil
+        sleepSuspendedForExternalDisplay = false
+        externalDisplayLastSeen = nil
         latchReleasedTime = clock()
         log("\(reason) Releasing display lock.")
         wakeTrigger()
@@ -331,6 +376,31 @@ public class LidLatchManager {
             return state
         }
         return false
+    }
+    
+    /// Whether any non-built-in display (monitor, TV, AirPlay/Sidecar display) is connected.
+    public static func defaultExternalDisplayConnected() -> Bool {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        var found: UInt32 = 0
+        guard CGGetOnlineDisplayList(count, &displays, &found) == .success else { return false }
+        return displays.prefix(Int(found)).contains { CGDisplayIsBuiltin($0) == 0 }
+    }
+    
+    /// Wraps a reader so the underlying call runs at most once per `interval`.
+    static func cached(_ reader: @escaping () -> Bool, interval: TimeInterval) -> () -> Bool {
+        var lastValue = false
+        var lastRead: Date?
+        return {
+            let now = Date()
+            if let last = lastRead, now.timeIntervalSince(last) < interval {
+                return lastValue
+            }
+            lastValue = reader()
+            lastRead = now
+            return lastValue
+        }
     }
     
     /// Seconds since the most recent keypress, modifier change, or mouse click.
